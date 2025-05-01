@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <time.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -19,6 +20,7 @@ typedef uint16_t u16;
 #define WIN_HEIGHT (RESY * 10)
 
 #define TIMER_TICK_TIME (1.0 / 60.0)
+#define BEEP_VOLUME 0.2f
 
 #define MEM_SIZE 4096
 #define PROGRAM_ADDR 0x200
@@ -121,7 +123,6 @@ bool is_key_pressed(u8 key)
         case 0x8: return IsKeyDown(KEY_S);
         case 0x9: return IsKeyDown(KEY_D);
         case 0xE: return IsKeyDown(KEY_F);
-        case 0xA: return IsKeyDown(KEY_Z);
         case 0x0: return IsKeyDown(KEY_X);
         case 0xB: return IsKeyDown(KEY_C);
         case 0xF: return IsKeyDown(KEY_V);
@@ -129,30 +130,27 @@ bool is_key_pressed(u8 key)
     }
 }
 
-// get the next key in the queue
-// returns the key or -1 if not a valid key
+// get poll for *released* key
 int get_key()
 {
-    int key = GetKeyPressed();
-    switch (key) {
-        case KEY_ONE: return 0x1;
-        case KEY_TWO: return 0x2;
-        case KEY_THREE: return 0x3;
-        case KEY_FOUR: return 0xC;
-        case KEY_Q: return 0x4;
-        case KEY_W: return 0x5;
-        case KEY_E: return 0x6;
-        case KEY_R: return 0xD;
-        case KEY_A: return 0x7;
-        case KEY_S: return 0x8;
-        case KEY_D: return 0x9;
-        case KEY_F: return 0xE;
-        case KEY_Z: return 0xA;
-        case KEY_X: return 0x0;
-        case KEY_C: return 0xB;
-        case KEY_V: return 0xF;
-        default: return -1;
-    }
+    if (IsKeyReleased(KEY_ONE)) return 0x1;
+    if (IsKeyReleased(KEY_TWO)) return 0x2;
+    if (IsKeyReleased(KEY_THREE)) return 0x3;
+    if (IsKeyReleased(KEY_FOUR)) return 0xC;
+    if (IsKeyReleased(KEY_Q)) return 0x4;
+    if (IsKeyReleased(KEY_W)) return 0x5;
+    if (IsKeyReleased(KEY_E)) return 0x6;
+    if (IsKeyReleased(KEY_R)) return 0xD;
+    if (IsKeyReleased(KEY_A)) return 0x7;
+    if (IsKeyReleased(KEY_S)) return 0x8;
+    if (IsKeyReleased(KEY_D)) return 0x9;
+    if (IsKeyReleased(KEY_F)) return 0xE;
+    if (IsKeyReleased(KEY_Z)) return 0xA;
+    if (IsKeyReleased(KEY_X)) return 0x0;
+    if (IsKeyReleased(KEY_C)) return 0xB;
+    if (IsKeyReleased(KEY_V)) return 0xF;
+
+    return -1;
 }
 
 // each bit represents a pixel on/off
@@ -179,6 +177,17 @@ void draw_sprite(Cpu *cpu, u8 x, u8 y, u16 addr, u8 nbytes)
             if (is_set && !screen[idx]) {
                 cpu->registers[0xF] = 1;
             }
+        }
+    }
+}
+
+void update_pixels(Color *pixels)
+{
+    for (int i = 0; i < RESX*RESY; i++) {
+        if (screen[i]) {
+            pixels[i] = COLOR_ON;
+        } else {
+            pixels[i] = COLOR_OFF;
         }
     }
 }
@@ -429,10 +438,14 @@ void execute_instruction(Cpu *cpu, u16 instruction)
                 // set delay timer
                 case 0x15:
                     cpu->delay_timer = cpu->registers[idx];
+                    if (!cpu->delay_timer)
+                        cpu->last_delay_tick = GetTime();
                 break;
                 // set sound timer
                 case 0x18:
                     cpu->sound_timer = cpu->registers[idx];
+                    if (!cpu->sound_timer)
+                        cpu->last_sound_tick = GetTime();
                 break;
                 // add to index
                 case 0x1E:
@@ -480,15 +493,30 @@ void execute_instruction(Cpu *cpu, u16 instruction)
     }
 }
 
-void update_pixels(Color *pixels)
+#define SAMPLE_RATE 44100
+#define BEEP_DURATION 1
+#define BEEP_FREQUENCY 240
+#define SAMPLES (int)(SAMPLE_RATE * BEEP_DURATION)
+Sound load_sound()
 {
-    for (int i = 0; i < RESX*RESY; i++) {
-        if (screen[i]) {
-            pixels[i] = COLOR_ON;
-        } else {
-            pixels[i] = COLOR_OFF;
-        }
+    short *data = malloc(SAMPLES * sizeof(short));
+    for (int i = 0; i < SAMPLES; i++) {
+        float amplitude = 20000.0f;
+        float time = (float)i / SAMPLE_RATE;
+        data[i] = (short)(amplitude * sinf(2.0f * PI * BEEP_FREQUENCY * time));
     }
+
+    Wave wave = {
+        .frameCount = SAMPLES,
+        .sampleRate = SAMPLE_RATE,
+        .sampleSize = 16,
+        .channels = 1,
+        .data = data,
+    };
+    Sound sound = LoadSoundFromWave(wave);
+    UnloadWave(wave);
+
+    return sound;
 }
 
 int main(int argc, char *argv[])
@@ -498,7 +526,6 @@ int main(int argc, char *argv[])
         printf("Usage: emu <rom.ch8>\n");
         return 1;
     }
-
     char *filepath = argv[1];
     int program_len;
     u8 *program_data = LoadFileData(filepath, &program_len);
@@ -514,6 +541,10 @@ int main(int argc, char *argv[])
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(WIN_WIDTH, WIN_HEIGHT, "Chip-8");
 
+    InitAudioDevice();
+    Sound sound = load_sound();
+    SetSoundVolume(sound, BEEP_VOLUME);
+
     Color pixels[RESX*RESY];
     Texture render_target = LoadTextureFromImage((Image) {
             .data = pixels,
@@ -523,10 +554,31 @@ int main(int argc, char *argv[])
             .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
         });
 
+    // event loop
     while(!WindowShouldClose()) {
 
         u16 instruction = read_instruction(&cpu);
         execute_instruction(&cpu, instruction);
+
+        // update timers
+        double time = GetTime();
+        if (cpu.delay_timer > 0) {
+            if (time - cpu.last_delay_tick > TIMER_TICK_TIME) {
+                cpu.delay_timer--;
+                cpu.last_delay_tick = time;
+            }
+        }
+        if (cpu.sound_timer > 1) {
+            if (GetTime() - cpu.last_sound_tick > TIMER_TICK_TIME) {
+                cpu.sound_timer--;
+                cpu.last_sound_tick = time;
+                if (!IsSoundPlaying(sound)) {
+                    PlaySound(sound);
+                }
+            }
+        } else if (IsSoundPlaying(sound)) {
+            StopSound(sound);
+        }
 
         if (screen_should_refresh) {
             screen_should_refresh = false;
@@ -536,7 +588,6 @@ int main(int argc, char *argv[])
 
         // Rendering
         BeginDrawing();
-
         Rectangle src = {0, 0, RESX, RESY};
         Rectangle dst = {0, 0, WIN_WIDTH, WIN_HEIGHT};
         DrawTexturePro(render_target, src, dst, (Vector2){0}, 0.0f, WHITE);
