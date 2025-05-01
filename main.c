@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <time.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <assert.h>
@@ -16,10 +18,15 @@ typedef uint16_t u16;
 #define WIN_WIDTH (RESX * 10)
 #define WIN_HEIGHT (RESY * 10)
 
+#define TIMER_TICK_TIME (1.0 / 60.0)
+
 #define MEM_SIZE 4096
 #define PROGRAM_ADDR 0x200
 
 #define STACK_CAP 32
+
+#define ERROR(fmt, ...) ({ fprintf(stderr, "ERROR: "fmt"\n", ##__VA_ARGS__); exit(1); })
+#define LOG(fmt, ...) printf("LOG: "fmt"\n", ##__VA_ARGS__)
 
 typedef struct Stack {
     u16 buffer[STACK_CAP];
@@ -37,6 +44,9 @@ typedef struct Cpu {
     // when not zero these timers count down at 60Hz
     u8 delay_timer;
     u8 sound_timer;
+
+    double last_delay_tick;
+    double last_sound_tick;
 } Cpu;
 
 #define BYTES_PER_CHARACTER 5
@@ -62,20 +72,21 @@ static u8 font_data[] = {
 
 // Screen buffer
 #define COLOR_ON WHITE
-#define COLOR_OFF BLACK
+#define COLOR_OFF DARKGRAY
 static bool screen[RESX*RESY] = {0};
 static bool screen_should_refresh = true;
 
 void stack_push(Stack *s, u16 data)
 {
-    assert(s->idx + 1 < STACK_CAP);
+    assert(s->idx < STACK_CAP);
     s->buffer[s->idx++] = data;
 }
 
 u16 stack_pop(Stack *s)
 {
     assert(s->idx - 1 >= 0);
-    u16 data = s->buffer[s->idx--];
+    // need to decrement before reading value on top
+    u16 data = s->buffer[--s->idx];
     return data;
 }
 
@@ -94,9 +105,60 @@ u16 read_instruction(Cpu *cpu)
     return hi << 8 | lo;
 }
 
+// simulates hex numpad with left side of keyboard
+bool is_key_pressed(u8 key)
+{
+    switch (key) {
+        case 0x1: return IsKeyDown(KEY_ONE);
+        case 0x2: return IsKeyDown(KEY_TWO);
+        case 0x3: return IsKeyDown(KEY_THREE);
+        case 0xC: return IsKeyDown(KEY_FOUR);
+        case 0x4: return IsKeyDown(KEY_Q);
+        case 0x5: return IsKeyDown(KEY_W);
+        case 0x6: return IsKeyDown(KEY_E);
+        case 0xD: return IsKeyDown(KEY_R);
+        case 0x7: return IsKeyDown(KEY_A);
+        case 0x8: return IsKeyDown(KEY_S);
+        case 0x9: return IsKeyDown(KEY_D);
+        case 0xE: return IsKeyDown(KEY_F);
+        case 0xA: return IsKeyDown(KEY_Z);
+        case 0x0: return IsKeyDown(KEY_X);
+        case 0xB: return IsKeyDown(KEY_C);
+        case 0xF: return IsKeyDown(KEY_V);
+        default: return false;
+    }
+}
+
+// get the next key in the queue
+// returns the key or -1 if not a valid key
+int get_key()
+{
+    int key = GetKeyPressed();
+    switch (key) {
+        case KEY_ONE: return 0x1;
+        case KEY_TWO: return 0x2;
+        case KEY_THREE: return 0x3;
+        case KEY_FOUR: return 0xC;
+        case KEY_Q: return 0x4;
+        case KEY_W: return 0x5;
+        case KEY_E: return 0x6;
+        case KEY_R: return 0xD;
+        case KEY_A: return 0x7;
+        case KEY_S: return 0x8;
+        case KEY_D: return 0x9;
+        case KEY_F: return 0xE;
+        case KEY_Z: return 0xA;
+        case KEY_X: return 0x0;
+        case KEY_C: return 0xB;
+        case KEY_V: return 0xF;
+        default: return -1;
+    }
+}
+
 // each bit represents a pixel on/off
 // sprites width is 1 byte
-void draw_sprite(Cpu *cpu, u8 x, u8 y, u16 addr, u8 nbytes) {
+void draw_sprite(Cpu *cpu, u8 x, u8 y, u16 addr, u8 nbytes)
+{
 
     cpu->registers[0xF] = 0;
     for (int row = 0; row < nbytes; row++) {
@@ -124,7 +186,9 @@ void draw_sprite(Cpu *cpu, u8 x, u8 y, u16 addr, u8 nbytes) {
 void execute_instruction(Cpu *cpu, u16 instruction)
 {
     u8 op = ((instruction >> 12) & 0xF);
+
     switch (op) {
+
         case 0x0: {
             // NOTE:: 0xNNN is not implemented
 
@@ -133,7 +197,7 @@ void execute_instruction(Cpu *cpu, u16 instruction)
                 memset(screen, false, RESX*RESY);
                 screen_should_refresh = true;
             // Return from subroutine
-            } else if (0x00EE) {
+            } else if (instruction == 0x00EE) {
                 u16 addr = stack_pop(&cpu->stack);
                 cpu->pc = addr;
             }
@@ -142,25 +206,148 @@ void execute_instruction(Cpu *cpu, u16 instruction)
 
         // Jump
         case 0x1: {
-            u16 addr = instruction & 0x0FFF;
+            u16 addr = instruction & 0xFFF;
             cpu->pc = addr;
         }
         break;
 
+        // execute subroutine
         case 0x2: {
-
+            u16 addr = instruction & 0xFFF;
+            stack_push(&cpu->stack, cpu->pc);
+            cpu->pc = addr;
         }
         break;
-        case 0x3: {
 
+        // skip next instruction if X == N
+        case 0x3: {
+            u8 idx = (instruction >> 8) & 0xF;
+            u8 value = instruction & 0xFF;
+            if (cpu->registers[idx] == value) {
+                cpu->pc += 2;
+            }
+        }
+        break;
+
+        // skip next instruction if X != N
+        case 0x4: {
+            u8 idx = (instruction >> 8) & 0xF;
+            u8 value = instruction & 0xFF;
+            if (cpu->registers[idx] != value) {
+                cpu->pc += 2;
+            }
+        }
+        break;
+
+        // skip next instruction if X == Y
+        case 0x5: {
+            u8 x_idx = (instruction >> 8) & 0xF;
+            u8 y_idx = (instruction >> 4) & 0xF;
+            if (cpu->registers[x_idx] == cpu->registers[y_idx]) {
+                cpu->pc += 2;
+            }
         }
         break;
 
         // Load register with value
         case 0x6: {
-            u8 reg_idx = (instruction >> 8) & 0xF;
+            u8 idx = (instruction >> 8) & 0xF;
             u8 value = instruction & 0xFF;
-            cpu->registers[reg_idx] = value;
+            cpu->registers[idx] = value;
+        }
+        break;
+
+        // Add to register
+        case 0x7: {
+            u8 idx = (instruction >> 8) & 0xF;
+            u8 value = instruction & 0xFF;
+            cpu->registers[idx] += value;
+        }
+        break;
+
+        //---Register manipulation---
+        case 0x8: {
+            u8 x_idx = (instruction >> 8) & 0xF;
+            u8 y_idx = (instruction >> 4) & 0xF;
+            u8 sub_op = instruction & 0xF;
+            u8 *reg = cpu->registers;
+            switch (sub_op) {
+                // set
+                case 0x0:
+                    reg[x_idx] = reg[y_idx];
+                break;
+                // or
+                case 0x1:
+                    reg[x_idx] |= reg[y_idx];
+                break;
+                // and
+                case 0x2:
+                    reg[x_idx] &= reg[y_idx];
+                break;
+                // xor
+                case 0x3:
+                    reg[x_idx] ^= reg[y_idx];
+                break;
+                // add
+                case 0x4: {
+                    u8 x_val = reg[x_idx];
+                    reg[x_idx] += reg[y_idx];
+                    if (x_val > reg[x_idx]) {
+                        reg[0xF] = 1;
+                    } else {
+                        reg[0xF] = 0;
+                    }
+                }
+                break;
+                // sub
+                case 0x5: {
+                    u8 x_val = reg[x_idx];
+                    reg[x_idx] -= reg[y_idx];
+                    if (x_val < reg[x_idx]) {
+                        reg[0xF] = 1;
+                    } else {
+                        reg[0xF] = 0;
+                    }
+                }
+                break;
+                // shr
+                case 0x6: {
+                    // lsb in flag
+                    reg[0xF] = reg[y_idx] & 0x1;
+                    reg[x_idx] = reg[y_idx] >> 1;
+                }
+                break;
+                // sub from y
+                case 0x7: {
+                    u8 y_val = reg[y_idx];
+                    reg[x_idx] = reg[y_idx] - reg[x_idx];
+                    if (y_val < reg[y_idx]) {
+                        reg[0xF] = 1;
+                    } else {
+                        reg[0xF] = 0;
+                    }
+                }
+                break;
+                case 0xE: {
+                    // msb in flag
+                    reg[0xF] = reg[y_idx] >> 7;
+                    reg[x_idx] = reg[y_idx] << 1;
+                }
+                break;
+
+                default: ERROR("invalid instruction %x", instruction);
+            }
+
+        }
+        break;
+
+        // skip next instruction if X != Y
+        case 0x9: {
+            u8 x_idx = (instruction >> 8) & 0xF;
+            u8 y_idx = (instruction >> 4) & 0xF;
+            if (cpu->registers[x_idx] != cpu->registers[y_idx]) {
+                cpu->pc += 2;
+            }
         }
         break;
 
@@ -168,6 +355,21 @@ void execute_instruction(Cpu *cpu, u16 instruction)
         case 0xA: {
             u16 addr = instruction & 0xFFF;
             cpu->index = addr;
+        }
+        break;
+
+        // jump to address + V0
+        case 0xB : {
+            u16 addr = instruction & 0xFFF;
+            cpu->pc = addr + cpu->registers[0];
+        }
+        break;
+
+        // set register to random number & NN
+        case 0xC: {
+            u8 idx = (instruction >> 8) & 0xF;
+            u16 val = instruction & 0xFF;
+            cpu->registers[idx] = rand() & val;
         }
         break;
 
@@ -182,6 +384,99 @@ void execute_instruction(Cpu *cpu, u16 instruction)
             screen_should_refresh = true;
         }
         break;
+
+        // skip next instruction if key in register is pressed or not pressed
+        case 0xE: {
+            u8 idx = (instruction >> 8) & 0xF;
+            u8 subop = instruction & 0xFF;
+            u8 key = cpu->registers[idx];
+            if (subop == 0x9E) {
+                if (is_key_pressed(key)) {
+                    cpu->pc += 2;
+                }
+            } else if (subop == 0xA1) {
+                if (!is_key_pressed(key)) {
+                    cpu->pc += 2;
+                }
+            } else {
+                ERROR("invalid instruction %x", instruction);
+            }
+        }
+        break;
+
+        case 0xF: {
+            u8 idx = (instruction >> 8) & 0xF;
+            u8 subop = instruction & 0xFF;
+            switch (subop) {
+
+                // store delay timer in register
+                case 0x07: 
+                    cpu->registers[idx] = cpu->delay_timer;
+                break;
+
+                // get key (waits until there is input)
+                case 0x0A: {
+                    int key = get_key();
+                    if (key < 0) {
+                        // this blocks on this op until there is key in queue
+                        cpu->pc -= 2;
+                    } else {
+                        cpu->registers[idx] = (u8)key;
+                    }
+                }
+                break;
+
+                // set delay timer
+                case 0x15:
+                    cpu->delay_timer = cpu->registers[idx];
+                break;
+                // set sound timer
+                case 0x18:
+                    cpu->sound_timer = cpu->registers[idx];
+                break;
+                // add to index
+                case 0x1E:
+                    cpu->index += cpu->registers[idx];
+                break;
+
+                // set index register to addr of font sprite for char in register
+                case 0x29: {
+                    u16 addr = FONT_ADDR + cpu->registers[idx]*BYTES_PER_CHARACTER;
+                    cpu->index = addr;
+                }
+                break;
+                // store value in register as BCD at index addr
+                case 0x33: {
+                    u16 index = cpu->index;
+                    u8 value = cpu->registers[idx];
+                    cpu->memory[index + 2] = value % 10;
+                    value /= 10;
+                    cpu->memory[index + 1] = value % 10;
+                    value /= 10;
+                    cpu->memory[index] = value % 10;
+                }
+                break;
+                // write register values to index addr
+                case 0x55: {
+                    for (int i = 0; i <= idx; i++)
+                        cpu->memory[cpu->index + i] = cpu->registers[i];
+                    cpu->index += idx + 1;
+                }
+                break;
+                // read index addr values into registers
+                case 0x65: {
+                    for (int i = 0; i <= idx; i++)
+                         cpu->registers[i] = cpu->memory[cpu->index + i];
+                    cpu->index += idx + 1;
+                }
+                break;
+
+                default: ERROR("invalid instruction %x", instruction);
+            }
+        }
+        break;
+
+        default: ERROR("invalid instruction %x", instruction);
     }
 }
 
@@ -213,6 +508,8 @@ int main(int argc, char *argv[])
     load_program(&cpu, program_data, program_len);
     // load the font
     memcpy(&cpu.memory[FONT_ADDR], font_data, sizeof(font_data));
+    // randomize seed
+    srand(time(NULL));
 
     SetTraceLogLevel(LOG_WARNING);
     InitWindow(WIN_WIDTH, WIN_HEIGHT, "Chip-8");
