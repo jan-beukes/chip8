@@ -14,13 +14,12 @@ typedef uint16_t u16;
 #define RESX 64
 #define RESY 32
 
-#define SPRITE_WIDTH 8
-
-#define WIN_WIDTH (RESX * 10)
-#define WIN_HEIGHT (RESY * 10)
+#define WIN_WIDTH (RESX * 15)
+#define WIN_HEIGHT (RESY * 15)
 
 #define TIMER_TICK_TIME (1.0 / 60.0)
 #define BEEP_VOLUME 0.2f
+#define CLOCK_SPEED 700 // Hz
 
 #define MEM_SIZE 4096
 #define PROGRAM_ADDR 0x200
@@ -73,8 +72,8 @@ static u8 font_data[] = {
 };
 
 // Screen buffer
-#define COLOR_ON WHITE
-#define COLOR_OFF DARKGRAY
+#define COLOR_ON RAYWHITE
+#define COLOR_OFF BLACK
 static bool screen[RESX*RESY] = {0};
 static bool screen_should_refresh = true;
 
@@ -88,7 +87,7 @@ u16 stack_pop(Stack *s)
 {
     assert(s->idx - 1 >= 0);
     // need to decrement before reading value on top
-    u16 data = s->buffer[--s->idx];
+    u16 data = *(s->buffer + --s->idx);
     return data;
 }
 
@@ -123,6 +122,7 @@ bool is_key_pressed(u8 key)
         case 0x8: return IsKeyDown(KEY_S);
         case 0x9: return IsKeyDown(KEY_D);
         case 0xE: return IsKeyDown(KEY_F);
+        case 0xA: return IsKeyDown(KEY_Z);
         case 0x0: return IsKeyDown(KEY_X);
         case 0xB: return IsKeyDown(KEY_C);
         case 0xF: return IsKeyDown(KEY_V);
@@ -288,14 +288,17 @@ void execute_instruction(Cpu *cpu, u16 instruction)
                 // or
                 case 0x1:
                     reg[x_idx] |= reg[y_idx];
+                    reg[0xF] = 0;
                 break;
                 // and
                 case 0x2:
                     reg[x_idx] &= reg[y_idx];
+                    reg[0xF] = 0;
                 break;
                 // xor
                 case 0x3:
                     reg[x_idx] ^= reg[y_idx];
+                    reg[0xF] = 0;
                 break;
                 // add
                 case 0x4: {
@@ -526,9 +529,24 @@ int main(int argc, char *argv[])
         printf("Usage: emu <rom.ch8>\n");
         return 1;
     }
-    char *filepath = argv[1];
+
+    long clock_speed = CLOCK_SPEED;
+    if (argc > 3) {
+        // clock speed
+        if (strcmp(argv[1], "-c") == 0) {
+            long input = strtol(argv[2], NULL, 10);
+            if (input > 0) {
+                clock_speed = input;
+            }
+        }
+    }
+
+    char *filepath = argv[argc - 1];
     int program_len;
     u8 *program_data = LoadFileData(filepath, &program_len);
+    if (program_data == NULL) {
+        ERROR("Could not open file %s", filepath);
+    }
 
     // init computer
     Cpu cpu = {0};
@@ -555,10 +573,14 @@ int main(int argc, char *argv[])
         });
 
     // event loop
+    double last_op = 0;
     while(!WindowShouldClose()) {
 
-        u16 instruction = read_instruction(&cpu);
-        execute_instruction(&cpu, instruction);
+        if (GetTime() - last_op > (1.0 / clock_speed)) {
+            last_op = GetTime();
+            u16 instruction = read_instruction(&cpu);
+            execute_instruction(&cpu, instruction);
+        }
 
         // update timers
         double time = GetTime();
@@ -592,6 +614,7 @@ int main(int argc, char *argv[])
         Rectangle dst = {0, 0, WIN_WIDTH, WIN_HEIGHT};
         DrawTexturePro(render_target, src, dst, (Vector2){0}, 0.0f, WHITE);
 
+        // polls for input
         EndDrawing();
     }
 
