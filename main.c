@@ -556,8 +556,10 @@ int main(int argc, char *argv[])
     // randomize seed
     srand(time(NULL));
 
+
     SetTraceLogLevel(LOG_WARNING);
-    InitWindow(WIN_WIDTH, WIN_HEIGHT, "Chip-8");
+    const char *game_name = GetFileNameWithoutExt(GetFileName(filepath));
+    InitWindow(WIN_WIDTH, WIN_HEIGHT, game_name);
 
     InitAudioDevice();
     Sound sound = load_sound();
